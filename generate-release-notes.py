@@ -68,7 +68,19 @@ class GitHubAPI:
             
             # Get files changed in this commit
             commit_detail_url = f"{self.base_url}/commits/{commit['sha']}"
-            commit_detail = requests.get(commit_detail_url, headers=self.headers).json()
+            # Request the diff as well by specifying the 'Accept' header
+            headers_with_diff = self.headers.copy()
+            headers_with_diff["Accept"] = "application/vnd.github.v3.diff"
+            
+            # Get the diff
+            diff_response = requests.get(commit_detail_url, headers=headers_with_diff)
+            diff_response.raise_for_status()
+            diff_content = diff_response.text
+            
+            # Get the commit details (for file information)
+            commit_detail_response = requests.get(commit_detail_url, headers=self.headers)
+            commit_detail_response.raise_for_status()
+            commit_detail = commit_detail_response.json()
             files_changed = commit_detail.get("files", [])
             
             # Skip if all changes are in vendor folder or only in go.mod/go.sum
@@ -76,19 +88,23 @@ class GitHubAPI:
                 logger.debug(f"Skipping commit with filtered changes: {commit['sha']}")
                 continue
             
+            # Get pull request details for this commit
             pull_request_data = self._get_pull_request_for_commit(commit["sha"])
-
+            
             commit_data = {
                 "sha": commit["sha"][:7],  # Short SHA
                 "message": commit["commit"]["message"].split("\n")[0],  # First line only
                 "author": commit["commit"]["author"]["name"],
                 "date": commit["commit"]["author"]["date"],
                 "html_url": commit["html_url"],
-                "pull_request": pull_request_data
+                "pull_request": pull_request_data,  # Add PR data to commit info
+                "diff": diff_content,  # Add the diff to commit info
+                "files_changed": files_changed  # Add files_changed info with stats
             }
+ 
             commits.append(commit_data)
-        # print(f"Processing commit: {commits}")
-            
+        #print(f"Processing commits: {commits}")
+        
         logger.info(f"Found {len(commits)} commits between {from_ref} and {to_ref} after filtering")
         return commits
     
@@ -115,7 +131,7 @@ class GitHubAPI:
         
         # Use the first PR (typically there's only one PR per commit)
         pr = pull_requests[0]
-       # Extract relevant PR information
+       # Extract relevant PR information    
         return {
             "number": pr.get("number"),
             "title": pr.get("title"),
@@ -126,8 +142,8 @@ class GitHubAPI:
             "created_at": pr.get("created_at"),
             "merged_at": pr.get("merged_at"),
             "user": {
-                "login": pr.get("user", {}).get("login"),
-                "html_url": pr.get("user", {}).get("html_url")
+            "login": pr.get("user", {}).get("login"),
+            "html_url": pr.get("user", {}).get("html_url")
             }
         }
 
@@ -226,27 +242,62 @@ def generate_release_notes(commits: List[Dict[str, Any]], model: str, api_key: s
     prompt = f"""
 You are an expert release analysis assistant.
 
-From the following list of git commit messages, extract **only the following**:
+From the following list of git commits, extract and categorize changes into the following sections:
 
 1. 🚨 **Breaking Changes**: Any code or behavior changes that may cause failures, remove or alter APIs, modify existing functionality, or introduce backward incompatibility.
-2. ⚙️ **Configuration Changes**: Any changes that introduce, remove, or modify configuration files, environment variables, deployment manifests, feature flags, or system-level parameters.
+2. ✨ **New Features**: Any new functionality, capabilities, or enhancements added to the system.
+3. 🔧 **Improvements**: Enhancements to existing features that don't add entirely new functionality.
+4. 🐛 **Bug Fixes**: Corrections to resolve issues, errors, or unexpected behavior.
+5. 📝 **Documentation Changes**: Updates to documentation, examples, or comments.
+6. ⚙️ **Configuration Changes**: Any changes that introduce, remove, or modify configuration files, environment variables, deployment manifests, feature flags, or system-level parameters.
+7. 🔄 **Dependencies**: Updates to external dependencies, libraries, or modules.
 
 Do NOT include a general changelog or commit list. Focus only on what is essential for teams to verify safety and compatibility after an upgrade.
 
 For each item, include:
 - The commit hash in backticks (e.g., `abc1234`)
-- A concise summary of what changed and why it might be important
+- A very concise summary of what changed (summarize the commit message)
 - The author name in parentheses
+- The pull request link in square brackets with the PR number [PR #123](https://github.com/...)
 
 Output format (in **Markdown**):
 
 ### 🚨 Breaking Changes
-- `commit-hash`: Short summary (Author)
+- `commit-hash`: Short summary (Author) [PR #123](pr_link)
+
+### ✨ New Features
+- `commit-hash`: Short summary (Author) [PR #123](pr_link)
+
+### 🔧 Improvements
+- `commit-hash`: Short summary (Author) [PR #123](pr_link)
+
+### 🐛 Bug Fixes
+- `commit-hash`: Short summary (Author) [PR #123](pr_link)
+
+### 📝 Documentation Changes
+- `commit-hash`: Short summary (Author) [PR #123](pr_link)
 
 ### ⚙️ Configuration Changes
-- `commit-hash`: Short summary (Author)
+- `commit-hash`: Short summary (Author) [PR #123](pr_link)
+
+### 🔄 Dependencies
+- `commit-hash`: Short summary (Author) [PR #123](pr_link)
 
 If no entries are found in a section, omit the section entirely.
+
+When categorizing commits:
+1. Analyze the diff content to identify potentially breaking changes or any change(addition, removal) of environment variables, or configuration modifications
+2. Look for specific PR labels or commit message patterns:
+   - "feature", "feat", "enhancement" → New Features
+   - "fix", "bugfix", "resolve" → Bug Fixes
+   - "improve", "optimize", "refactor" → Improvements
+   - "breaking", "api-change" → Breaking Changes
+   - "docs", "documentation" → Documentation Changes
+   - "config", "deployment", "env" → Configuration Changes
+   - "dependency", "upgrade", "update" → Dependencies
+3. Check for configuration-related files or paths in the modified files list
+4. Examine commit messages for keywords like "api", "CRD", "breaking", "deprecated", "removed", "config", "manifest"
+
 Commit log:
 {formatted_commits}
 """
