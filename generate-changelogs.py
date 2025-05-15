@@ -7,6 +7,7 @@ import json
 import datetime
 from typing import List, Dict, Optional, Any, Union
 import requests
+import re  # For PR number extraction from commit messages
 
 # Try to import OpenAI, with graceful fallback if not installed
 try:
@@ -90,6 +91,20 @@ class GitHubAPI:
             
             # Get pull request details for this commit
             pull_request_data = self._get_pull_request_for_commit(commit["sha"])
+            pr_number = None
+            pr_url = None
+            if pull_request_data:
+                pr_number = pull_request_data.get("number")
+                pr_url = pull_request_data.get("html_url")
+            else:
+                # Try to extract PR number from commit message (e.g., #1234 or PR #1234)
+                msg = commit["commit"]["message"]
+                match = re.search(r'#(\d+)', msg)
+                if not match:
+                    match = re.search(r'PR[\s#]*(\d+)', msg, re.IGNORECASE)
+                if match:
+                    pr_number = match.group(1)
+                    pr_url = f"https://github.com/{self.owner}/{self.repo}/pull/{pr_number}"
             
             commit_data = {
                 "sha": commit["sha"][:7],  # Short SHA
@@ -98,6 +113,8 @@ class GitHubAPI:
                 "date": commit["commit"]["author"]["date"],
                 "html_url": commit["html_url"],
                 "pull_request": pull_request_data,  # Add PR data to commit info
+                "pr_number": pr_number,  # Always add pr_number
+                "pr_url": pr_url,        # Always add pr_url
                 "diff": diff_content,  # Add the diff to commit info
                 "files_changed": files_changed  # Add files_changed info with stats
             }
@@ -235,7 +252,7 @@ def generate_release_notes(commits: List[Dict[str, Any]], model: str, api_key: s
     
     # Format commits for the prompt
     formatted_commits = "\n".join([
-        f"- {commit['sha']}: {commit['message']} ({commit['author']})" 
+        f"- {commit['sha']}: {commit['message']} ({commit['author']})" + (f" [PR #{commit['pr_number']}]({commit['pr_url']})" if commit.get('pr_number') and commit.get('pr_url') else "")
         for commit in commits
     ])
     
