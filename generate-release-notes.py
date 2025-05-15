@@ -41,7 +41,7 @@ class GitHubAPI:
             self.headers["Authorization"] = f"Bearer {token}"
     
     def get_commits_between(self, from_ref: str, to_ref: str) -> List[Dict[str, Any]]:
-        """Get commits between two references."""
+        """Get commits between two references with filtering."""
         logger.info(f"Fetching commits between {from_ref} and {to_ref}")
         
         # First, get the full commit SHA for both refs
@@ -60,17 +60,94 @@ class GitHubAPI:
         # Process commits
         commits = []
         for commit in comparison.get("commits", []):
+            # Skip if commit is from Dependabot[bot]
+            author_login = commit.get("author", {}).get("login", "")
+            if author_login == "dependabot[bot]":
+                logger.debug(f"Skipping Dependabot commit: {commit['sha']}")
+                continue
+            
+            # Get files changed in this commit
+            commit_detail_url = f"{self.base_url}/commits/{commit['sha']}"
+            commit_detail = requests.get(commit_detail_url, headers=self.headers).json()
+            files_changed = commit_detail.get("files", [])
+            
+            # Skip if all changes are in vendor folder or only in go.mod/go.sum
+            if self._should_skip_commit(files_changed):
+                logger.debug(f"Skipping commit with filtered changes: {commit['sha']}")
+                continue
+            
+            pull_request_data = self._get_pull_request_for_commit(commit["sha"])
+
             commit_data = {
                 "sha": commit["sha"][:7],  # Short SHA
                 "message": commit["commit"]["message"].split("\n")[0],  # First line only
                 "author": commit["commit"]["author"]["name"],
                 "date": commit["commit"]["author"]["date"],
-                "html_url": commit["html_url"]
+                "html_url": commit["html_url"],
+                "pull_request": pull_request_data
             }
             commits.append(commit_data)
-        
-        logger.info(f"Found {len(commits)} commits between {from_ref} and {to_ref}")
+        # print(f"Processing commit: {commits}")
+            
+        logger.info(f"Found {len(commits)} commits between {from_ref} and {to_ref} after filtering")
         return commits
+    
+    def _get_pull_request_for_commit(self, commit_sha: str) -> Dict[str, Any]:
+        """Get pull request details for a commit."""
+        # GitHub API endpoint to list pull requests associated with a commit
+        url = f"{self.base_url}/commits/{commit_sha}/pulls"
+        # Use the special 'Accept' header for the pulls API (this is a preview feature)
+        headers = self.headers.copy()
+        headers["Accept"] = "application/vnd.github.groot-preview+json"
+        
+        response = requests.get(url, headers=headers)
+        
+        # Handle API errors gracefully
+        if response.status_code != 200:
+            logger.warning(f"Failed to get PR details for commit {commit_sha}: {response.status_code}")
+            return None
+        
+        pull_requests = response.json()
+        
+        # If no PRs found, return None
+        if not pull_requests:
+            return None
+        
+        # Use the first PR (typically there's only one PR per commit)
+        pr = pull_requests[0]
+       # Extract relevant PR information
+        return {
+            "number": pr.get("number"),
+            "title": pr.get("title"),
+            "labels": pr.get("labels"),
+            "html_url": pr.get("html_url"),
+            "state": pr.get("state"),
+            "merged": pr.get("merged"),
+            "created_at": pr.get("created_at"),
+            "merged_at": pr.get("merged_at"),
+            "user": {
+                "login": pr.get("user", {}).get("login"),
+                "html_url": pr.get("user", {}).get("html_url")
+            }
+        }
+
+    def _should_skip_commit(self, files_changed: List[Dict[str, Any]]) -> bool:
+        """Determine if a commit should be skipped based on changed files."""
+        # If there are no files, don't skip
+        if not files_changed:
+            return False
+        
+        # Check if all files are either in vendor folder or are go.mod/go.sum
+        go_mod_files = {"go.mod", "go.sum"}
+        owners_files = {"OWNERS", "OWNERS_ALIASES"}
+        for file in files_changed:
+            file_path = file.get("filename", "")
+            # If any file is not in vendor and not go.mod/go.sum, don't skip the commit
+            if not file_path.startswith("vendor/") and file_path not in go_mod_files and file_path not in owners_files:
+                return False
+        
+        # All files are either in vendor folder or go.mod/go.sum
+        return True
     
     def _get_sha_for_ref(self, ref: str) -> Optional[str]:
         """Get the full SHA for a reference (branch, tag, commit)."""
@@ -147,23 +224,29 @@ def generate_release_notes(commits: List[Dict[str, Any]], model: str, api_key: s
     ])
     
     prompt = f"""
-You are a release note assistant.
-Generate a professional and concise release note from the following list of git commit messages.
-Group related items into these categories:
-- 🚀 New Features
-- 🐛 Bug Fixes
-- 📚 Documentation
-- 🔧 Maintenance
-- ⚙️ Performance
-- 🧪 Testing
+You are an expert release analysis assistant.
 
-Format the output in Markdown with the following rules:
-1. DO NOT include a title like "# Release Notes" or "# Changelog" - this will be added separately
-2. Use the emoji bullet points exactly as shown above
-3. For each item, include the commit hash in backticks like: `{{commit['sha']}}`: Commit message (Author name)
-4. Skip any categories that have no entries
-5. Keep the format consistent with the emoji followed by the category name and a colon
+From the following list of git commit messages, extract **only the following**:
 
+1. 🚨 **Breaking Changes**: Any code or behavior changes that may cause failures, remove or alter APIs, modify existing functionality, or introduce backward incompatibility.
+2. ⚙️ **Configuration Changes**: Any changes that introduce, remove, or modify configuration files, environment variables, deployment manifests, feature flags, or system-level parameters.
+
+Do NOT include a general changelog or commit list. Focus only on what is essential for teams to verify safety and compatibility after an upgrade.
+
+For each item, include:
+- The commit hash in backticks (e.g., `abc1234`)
+- A concise summary of what changed and why it might be important
+- The author name in parentheses
+
+Output format (in **Markdown**):
+
+### 🚨 Breaking Changes
+- `commit-hash`: Short summary (Author)
+
+### ⚙️ Configuration Changes
+- `commit-hash`: Short summary (Author)
+
+If no entries are found in a section, omit the section entirely.
 Commit log:
 {formatted_commits}
 """
