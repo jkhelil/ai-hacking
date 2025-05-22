@@ -40,6 +40,24 @@ class GitHubAPI:
         }
         if token:
             self.headers["Authorization"] = f"Bearer {token}"
+
+    def _should_skip_commit(self, files_changed: List[Dict[str, Any]]) -> bool:
+        """Determine if a commit should be skipped based on changed files."""
+        # If there are no files, don't skip
+        if not files_changed:
+            return False
+        
+        # Check if all files are either in vendor folder or are go.mod/go.sum
+        go_mod_files = {"go.mod", "go.sum"}
+        owners_files = {"OWNERS", "OWNERS_ALIASES"}
+        for file in files_changed:
+            file_path = file.get("filename", "")
+            # If any file is not in vendor and not go.mod/go.sum, don't skip the commit
+            if not file_path.startswith("vendor/") and file_path not in go_mod_files and file_path not in owners_files:
+                return False
+        
+        # All files are either in vendor folder or go.mod/go.sum
+        return True
     
     def get_commits_between(self, from_ref: str, to_ref: str) -> List[Dict[str, Any]]:
         """Get commits between two references with filtering."""
@@ -163,24 +181,6 @@ class GitHubAPI:
             "html_url": pr.get("user", {}).get("html_url")
             }
         }
-
-    def _should_skip_commit(self, files_changed: List[Dict[str, Any]]) -> bool:
-        """Determine if a commit should be skipped based on changed files."""
-        # If there are no files, don't skip
-        if not files_changed:
-            return False
-        
-        # Check if all files are either in vendor folder or are go.mod/go.sum
-        go_mod_files = {"go.mod", "go.sum"}
-        owners_files = {"OWNERS", "OWNERS_ALIASES"}
-        for file in files_changed:
-            file_path = file.get("filename", "")
-            # If any file is not in vendor and not go.mod/go.sum, don't skip the commit
-            if not file_path.startswith("vendor/") and file_path not in go_mod_files and file_path not in owners_files:
-                return False
-        
-        # All files are either in vendor folder or go.mod/go.sum
-        return True
     
     def _get_sha_for_ref(self, ref: str) -> Optional[str]:
         """Get the full SHA for a reference (branch, tag, commit)."""
@@ -256,10 +256,33 @@ def generate_release_notes(commits: List[Dict[str, Any]], model: str, api_key: s
         for commit in commits
     ])
     
+    template = """### 🚨 Breaking Changes
+[BREAKING_CHANGES]
+
+### ✨ New Features
+[NEW_FEATURES]
+
+### 🔧 Improvements
+[IMPROVEMENTS]
+
+### 🐛 Bug Fixes
+[BUG_FIXES]
+
+### 📝 Documentation Changes
+[DOCUMENTATION_CHANGES]
+
+### ⚙️ Configuration Changes
+[CONFIGURATION_CHANGES]
+
+### 🔄 Dependencies
+[DEPENDENCIES]"""
+
     prompt = f"""
 You are an expert release analysis assistant.
 
-From the following list of git commits, extract and categorize changes into the following sections:
+From the following list of git commits, you must fill in the template below by categorizing each commit into the appropriate section.
+
+**CATEGORIZATION RULES:**
 
 1. 🚨 **Breaking Changes**: Any code or behavior changes that may cause failures, remove or alter APIs, modify existing functionality, or introduce backward incompatibility.
 2. ✨ **New Features**: Any new functionality, capabilities, or enhancements added to the system.
@@ -269,41 +292,15 @@ From the following list of git commits, extract and categorize changes into the 
 6. ⚙️ **Configuration Changes**: Any changes that introduce, remove, or modify configuration files, environment variables, deployment manifests, feature flags, or system-level parameters.
 7. 🔄 **Dependencies**: Updates to external dependencies, libraries, or modules.
 
-Do NOT include a general changelog or commit list. Focus only on what is essential for teams to verify safety and compatibility after an upgrade.
+**FORMATTING REQUIREMENTS:**
+- For each commit, use this exact format: `commit-hash`: Short summary (Author) [PR #123](pr_link)
+- If a section has no commits, write "No changes in this category."
+- Do NOT omit any sections from the template
+- Do NOT add any additional text outside the template structure
+- Focus only on what is essential for teams to verify safety and compatibility after an upgrade
 
-For each item, include:
-- The commit hash in backticks (e.g., `abc1234`)
-- A very concise summary of what changed (summarize the commit message)
-- The author name in parentheses
-- The pull request link in square brackets with the PR number [PR #123](https://github.com/...)
-
-Output format (in **Markdown**):
-
-### 🚨 Breaking Changes
-- `commit-hash`: Short summary (Author) [PR #123](pr_link)
-
-### ✨ New Features
-- `commit-hash`: Short summary (Author) [PR #123](pr_link)
-
-### 🔧 Improvements
-- `commit-hash`: Short summary (Author) [PR #123](pr_link)
-
-### 🐛 Bug Fixes
-- `commit-hash`: Short summary (Author) [PR #123](pr_link)
-
-### 📝 Documentation Changes
-- `commit-hash`: Short summary (Author) [PR #123](pr_link)
-
-### ⚙️ Configuration Changes
-- `commit-hash`: Short summary (Author) [PR #123](pr_link)
-
-### 🔄 Dependencies
-- `commit-hash`: Short summary (Author) [PR #123](pr_link)
-
-If no entries are found in a section, omit the section entirely.
-
-When categorizing commits:
-1. Analyze the diff content to identify potentially breaking changes or any change(addition, removal) of environment variables, or configuration modifications
+**ANALYSIS GUIDELINES:**
+1. Analyze the diff content to identify potentially breaking changes or any change (addition, removal) of environment variables, or configuration modifications
 2. Look for specific PR labels or commit message patterns:
    - "feature", "feat", "enhancement" → New Features
    - "fix", "bugfix", "resolve" → Bug Fixes
@@ -315,8 +312,14 @@ When categorizing commits:
 3. Check for configuration-related files or paths in the modified files list
 4. Examine commit messages for keywords like "api", "CRD", "breaking", "deprecated", "removed", "config", "manifest"
 
-Commit log:
+**TEMPLATE TO FILL:**
+{template}
+
+**COMMIT LOG TO ANALYZE:**
 {formatted_commits}
+
+**INSTRUCTIONS:**
+Replace each [SECTION_NAME] placeholder with the appropriate commits for that category. If no commits belong to a category, replace the placeholder with "No changes in this category."
 """
     try:
         logger.info(f"Using AI model: {model}")
@@ -374,24 +377,190 @@ def parse_github_url(repo_url: str) -> tuple:
     repo = parts[1].replace(".git", "")
     return owner, repo
 
+def process_repository(repo_url: str, from_ref: str, to_ref: str, days_ago: int, nightly: bool,
+                       state_file: str, model: str, api_key: str, api_base_url: str, org_id: str, 
+                       github_token: str) -> Optional[Dict[str, Any]]:
+    """Process a single GitHub repository and generate release notes."""
+    try:
+        # Parse GitHub repository URL
+        owner, repo = parse_github_url(repo_url)
+        logger.info(f"Working with repository: {owner}/{repo}")
+        
+        # Initialize GitHub API client
+        github = GitHubAPI(owner, repo, github_token)
+        
+        # Determine the references to use
+        local_to_ref = to_ref
+        local_from_ref = from_ref
+        
+        # Handle nightly build scenario
+        if nightly:
+            logger.info("Running in nightly mode")
+            latest_commit = github.get_latest_commit(local_to_ref)
+            if not latest_commit:
+                logger.error(f"Could not get latest commit for {local_to_ref}")
+                return None
+            
+            latest_sha = latest_commit["sha"]
+            
+            # Try to get previous commit from state file
+            repo_state_file = f"{state_file}_{owner}_{repo}"
+            if os.path.exists(repo_state_file):
+                with open(repo_state_file, 'r') as f:
+                    local_from_ref = f.read().strip()
+                logger.info(f"Using commit from state file: {local_from_ref}")
+            elif days_ago:
+                # Fall back to days ago
+                commit_days_ago = github.get_commit_from_days_ago(days_ago, local_to_ref)
+                if commit_days_ago:
+                    local_from_ref = commit_days_ago["sha"]
+                    logger.info(f"Using commit from {days_ago} days ago: {local_from_ref}")
+                else:
+                    logger.error(f"Could not get commit from {days_ago} days ago")
+                    return None
+            else:
+                # Default to 1 day ago
+                commit_days_ago = github.get_commit_from_days_ago(1, local_to_ref)
+                if commit_days_ago:
+                    local_from_ref = commit_days_ago["sha"]
+                    logger.info(f"Using commit from 1 day ago: {local_from_ref}")
+                else:
+                    logger.error("Could not get commit from 1 day ago")
+                    return None
+        
+        # For non-nightly when days-ago is specified
+        elif days_ago and not local_from_ref:
+            commit_days_ago = github.get_commit_from_days_ago(days_ago, local_to_ref)
+            if commit_days_ago:
+                local_from_ref = commit_days_ago["sha"]
+                logger.info(f"Using commit from {days_ago} days ago: {local_from_ref}")
+            else:
+                logger.error(f"Could not get commit from {days_ago} days ago")
+                return None
+        
+        # Check if we have valid references
+        if not local_from_ref or not local_to_ref:
+            logger.error("Both from and to references are required")
+            return None
+        
+        # Get commits between references
+        commits = github.get_commits_between(local_from_ref, local_to_ref)
+        
+        if not commits:
+            logger.warning("No commits found between given refs.")
+            return {
+                "repo_url": repo_url,
+                "owner": owner,
+                "repo": repo,
+                "release_notes": f"No commits found for {owner}/{repo} between {local_from_ref} and {local_to_ref}",
+                "from_ref": local_from_ref,
+                "to_ref": local_to_ref,
+                "nightly": nightly,
+                "latest_commit": latest_commit if nightly else None
+            }
+        
+        # Generate release notes
+        logger.info(f"Sending {len(commits)} commits to AI for release note generation...")
+        release_notes = generate_release_notes(
+            commits, 
+            model, 
+            api_key, 
+            api_base_url,
+            org_id
+        )
+        
+        # If in nightly mode, update the state file with current commit
+        if nightly and latest_commit:
+            repo_state_file = f"{state_file}_{owner}_{repo}"
+            with open(repo_state_file, 'w') as f:
+                f.write(latest_commit["sha"])
+            logger.info(f"Updated state file with commit: {latest_commit['sha']}")
+        
+        return {
+            "repo_url": repo_url,
+            "owner": owner,
+            "repo": repo,
+            "release_notes": release_notes,
+            "from_ref": local_from_ref,
+            "to_ref": local_to_ref,
+            "nightly": nightly,
+            "latest_commit": latest_commit if nightly else None
+        }
+        
+    except Exception as e:
+        logger.error(f"Error processing {repo_url}: {str(e)}")
+        return None
+
+def create_combined_release_notes(repo_results: List[Dict[str, Any]]) -> str:
+    """Create a combined release notes document from multiple repositories."""
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    
+    # Create the header
+    combined_notes = f"# Combined Release Notes ({today})\n\n"
+    
+    # Summary section
+    combined_notes += "## Repositories Analyzed\n\n"
+    for repo_data in repo_results:
+        owner = repo_data["owner"]
+        repo = repo_data["repo"]
+        from_ref = repo_data["from_ref"]
+        to_ref = repo_data["to_ref"]
+        combined_notes += f"- **{owner}/{repo}**: Changes from `{from_ref}` to `{to_ref}`\n"
+    combined_notes += "\n"
+    
+    # Add each repository's release notes
+    for repo_data in repo_results:
+        owner = repo_data["owner"]
+        repo = repo_data["repo"]
+        release_notes = repo_data["release_notes"]
+        
+        combined_notes += f"## {owner}/{repo}\n\n"
+        combined_notes += release_notes + "\n\n"
+        combined_notes += "---\n\n"
+    
+    return combined_notes
+
 # ========== Main ==========
 def main():
     parser = argparse.ArgumentParser(description="Generate release notes from GitHub commits using AI")
-    parser.add_argument("--repo-url", required=True, help="GitHub repository URL")
+    # Repository options
+    parser.add_argument("--repo-url", help="GitHub repository URL (deprecated, use --repos instead)")
+    parser.add_argument("--repos", nargs='+', help="List of GitHub repository URLs to analyze")
+    parser.add_argument("--combined", action="store_true", help="Generate combined release notes from all repositories")
+    
+    # Reference options
     parser.add_argument("--from-ref", help="Starting git ref (tag, branch, or commit SHA)")
     parser.add_argument("--to-ref", default="main", help="Ending git ref (tag, branch, or commit SHA). Default: main")
     parser.add_argument("--days-ago", type=int, help="Days ago to use as start reference (alternative to --from-ref)")
+    
+    # GitHub options
     parser.add_argument("--github-token", help="GitHub Personal Access Token (defaults to GITHUB_TOKEN env var)")
+    
+    # OpenAI options
     parser.add_argument("--model", default="gpt-4", help="OpenAI model to use")
     parser.add_argument("--api-model", help="Alternative name to specify the OpenAI model")
     parser.add_argument("--api-key", help="OpenAI API key (defaults to OPENAI_API_KEY env var)")
     parser.add_argument("--api-base-url", default="https://api.openai.com/v1", help="OpenAI API base URL")
     parser.add_argument("--org-id", help="OpenAI organization ID")
+    
+    # Output options
     parser.add_argument("--output-file", help="Path to save release notes (optional)")
     parser.add_argument("--state-file", default=".last-nightly-commit", help="File to store last processed commit for nightly builds")
     parser.add_argument("--nightly", action="store_true", help="Generate nightly changelog using state file")
     
     args = parser.parse_args()
+    
+    # Validate repository arguments
+    if args.repos and args.repo_url:
+        logger.warning("Both --repos and --repo-url provided. Using --repos and ignoring --repo-url.")
+        repo_urls = args.repos
+    elif args.repos:
+        repo_urls = args.repos
+    elif args.repo_url:
+        repo_urls = [args.repo_url]
+    else:
+        logger.error("No repositories specified. Use --repos or --repo-url.")
+        return 1
     
     # Get GitHub token from args or environment
     github_token = args.github_token or os.environ.get("GITHUB_TOKEN")
@@ -405,107 +574,53 @@ def main():
     # Determine which model to use (api-model takes precedence over model)
     model = args.api_model or args.model
     
-    # Parse GitHub repository URL
-    try:
-        owner, repo = parse_github_url(args.repo_url)
-        logger.info(f"Working with repository: {owner}/{repo}")
-    except ValueError as e:
-        logger.error(str(e))
-        return 1
+    # Process each repository
+    repo_results = []
     
-    # Initialize GitHub API client
-    github = GitHubAPI(owner, repo, github_token)
-    
-    # Determine the references to use
-    to_ref = args.to_ref
-    from_ref = args.from_ref
-    
-    # Handle nightly build scenario
-    if args.nightly:
-        logger.info("Running in nightly mode")
-        latest_commit = github.get_latest_commit(to_ref)
-        if not latest_commit:
-            logger.error(f"Could not get latest commit for {to_ref}")
-            return 1
-        
-        latest_sha = latest_commit["sha"]
-        
-        # Try to get previous commit from state file
-        if os.path.exists(args.state_file):
-            with open(args.state_file, 'r') as f:
-                from_ref = f.read().strip()
-            logger.info(f"Using commit from state file: {from_ref}")
-        elif args.days_ago:
-            # Fall back to days ago
-            commit_days_ago = github.get_commit_from_days_ago(args.days_ago, to_ref)
-            if commit_days_ago:
-                from_ref = commit_days_ago["sha"]
-                logger.info(f"Using commit from {args.days_ago} days ago: {from_ref}")
-            else:
-                logger.error(f"Could not get commit from {args.days_ago} days ago")
-                return 1
-        else:
-            # Default to 1 day ago
-            commit_days_ago = github.get_commit_from_days_ago(1, to_ref)
-            if commit_days_ago:
-                from_ref = commit_days_ago["sha"]
-                logger.info(f"Using commit from 1 day ago: {from_ref}")
-            else:
-                logger.error("Could not get commit from 1 day ago")
-                return 1
-    
-    # For non-nightly when days-ago is specified
-    elif args.days_ago and not from_ref:
-        commit_days_ago = github.get_commit_from_days_ago(args.days_ago, to_ref)
-        if commit_days_ago:
-            from_ref = commit_days_ago["sha"]
-            logger.info(f"Using commit from {args.days_ago} days ago: {from_ref}")
-        else:
-            logger.error(f"Could not get commit from {args.days_ago} days ago")
-            return 1
-    
-    # Check if we have valid references
-    if not from_ref or not to_ref:
-        logger.error("Both from and to references are required")
-        return 1
-    
-    try:
-        # Get commits between references
-        commits = github.get_commits_between(from_ref, to_ref)
-        
-        if not commits:
-            logger.warning("No commits found between given refs.")
-            return 0
-        
-        # Generate release notes
-        logger.info(f"Sending {len(commits)} commits to AI for release note generation...")
-        release_notes = generate_release_notes(
-            commits, 
-            model, 
-            api_key, 
-            args.api_base_url,
-            args.org_id
+    for repo_url in repo_urls:
+        logger.info(f"\n=== Processing {repo_url} ===\n")
+        result = process_repository(
+            repo_url=repo_url,
+            from_ref=args.from_ref,
+            to_ref=args.to_ref,
+            days_ago=args.days_ago,
+            nightly=args.nightly,
+            state_file=args.state_file,
+            model=model,
+            api_key=api_key,
+            api_base_url=args.api_base_url,
+            org_id=args.org_id,
+            github_token=github_token
         )
         
-        # Save release notes if output file specified
-        save_release_notes(release_notes, args.output_file)
-        
-        # Print release notes
-        print("\n========== 📢 Release Notes ==========\n")
-        print(release_notes)
-        print("\n======================================\n")
-        
-        # If in nightly mode, update the state file with current commit
-        if args.nightly and latest_commit:
-            with open(args.state_file, 'w') as f:
-                f.write(latest_commit["sha"])
-            logger.info(f"Updated state file with commit: {latest_commit['sha']}")
-        
-    except Exception as e:
-        logger.error(f"Error: {str(e)}")
-        return 1
+        if result:
+            repo_results.append(result)
+            
+            # Print individual repository release notes if not generating combined
+            if not args.combined:
+                print(f"\n========== 📢 Release Notes for {result['owner']}/{result['repo']} ==========\n")
+                print(result["release_notes"])
+                print("\n======================================\n")
+                
+                # Save individual repository release notes if output file specified
+                if args.output_file and len(repo_urls) == 1:
+                    save_release_notes(result["release_notes"], args.output_file)
     
-    return 0
+    # Generate and save combined release notes if requested
+    if args.combined and repo_results:
+        combined_notes = create_combined_release_notes(repo_results)
+        
+        # Print combined release notes
+        print("\n========== 📢 Combined Release Notes ==========\n")
+        print(combined_notes)
+        print("\n=============================================\n")
+        
+        # Save combined release notes if output file specified
+        if args.output_file:
+            save_release_notes(combined_notes, args.output_file)
+    
+    # Return success if we processed at least one repository
+    return 0 if repo_results else 1
 
 if __name__ == "__main__":
     sys.exit(main())
