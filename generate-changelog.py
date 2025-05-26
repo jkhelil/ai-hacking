@@ -520,6 +520,96 @@ def create_combined_release_notes(repo_results: List[Dict[str, Any]]) -> str:
     
     return combined_notes
 
+def generate_upgrade_recommendations(combined_notes, model, api_key, api_base_url, org_name):
+    """
+    Generate upgrade risk assessment and recommendations based on combined release notes.
+    
+    Args:
+        combined_notes (str): The combined release notes from all repositories
+        model (str): AI model to use
+        api_key (str): API key for the AI service
+        api_base_url (str): Base URL for the API
+        org_id (str): Organization ID (optional)
+    
+    Returns:
+        str: Formatted upgrade recommendations and risk assessment
+    """
+    if not OPENAI_AVAILABLE:
+        logger.warning("OpenAI not available, skipping upgrade recommendations")
+        return ""
+    
+    try:
+        logger.info(f"Using AI model: {model}")
+        client_kwargs = {
+            "base_url": api_base_url,
+            "api_key": api_key,
+            "http_client": httpx.Client(verify=False)
+        }
+        
+        if org_name:
+            client_kwargs["organization"] = org_name
+            
+        client = openai.OpenAI(**client_kwargs)
+        
+        # Specialized prompt for upgrade risk assessment
+        upgrade_prompt = f"""
+You are an expert DevOps engineer analyzing software release notes to provide upgrade guidance. 
+
+Based on the following combined release notes, provide a comprehensive upgrade risk assessment and recommendations.
+
+RELEASE NOTES TO ANALYZE:
+{combined_notes}
+
+Please provide your analysis in the following format:
+
+# 🚀 Upgrade Guidance & Risk Assessment
+
+## 📊 Overall Risk Level
+[Categorize as one of the following with reasoning]
+- 🟢 **LOW RISK**: Mainly bug fixes, documentation updates, minor improvements
+- 🟡 **MEDIUM RISK**: New features, configuration changes, dependency updates  
+- 🔴 **HIGH RISK**: Breaking changes, API modifications, major refactoring
+
+## ⚠️ Key Changes to Review
+[List the most important changes that could impact users during upgrade]
+
+## ✅ Pre-Upgrade Checklist
+[Provide specific, actionable items teams should verify before upgrading, such as:]
+- Configuration file changes
+- Environment variable updates  
+- Database migrations required
+- API compatibility checks
+- Dependency version requirements
+- Backup recommendations
+
+Focus on practical, actionable guidance that development and operations teams can use to plan and execute a safe upgrade.
+"""
+        
+        logger.info("Making AI request for upgrade recommendations...")
+        
+        # Make API call
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system", 
+                    "content": "You are an expert DevOps engineer who specializes in software upgrade risk assessment and provides clear, actionable recommendations."
+                },
+                {"role": "user", "content": upgrade_prompt}
+            ],
+            temperature=0.3,  # Lower temperature for more consistent, factual analysis
+            max_tokens=2000
+        )
+        
+        upgrade_analysis = response.choices[0].message.content.strip()
+        logger.info("✅ Upgrade recommendations generated successfully")
+        
+        return upgrade_analysis
+        
+    except Exception as e:
+        logger.error(f"Failed to generate upgrade recommendations: {str(e)}")
+        return ""
+
 # ========== Main ==========
 def main():
     parser = argparse.ArgumentParser(description="Generate release notes from GitHub commits using AI")
@@ -547,6 +637,9 @@ def main():
     parser.add_argument("--output-file", help="Path to save release notes (optional)")
     parser.add_argument("--state-file", default=".last-nightly-commit", help="File to store last processed commit for nightly builds")
     parser.add_argument("--nightly", action="store_true", help="Generate nightly changelog using state file")
+    
+    # Upgrade recommendation options
+    parser.add_argument("--recommendation", action="store_true", help="Generate upgrade risk assessment and recommendations")
     
     args = parser.parse_args()
     
@@ -610,14 +703,33 @@ def main():
     if args.combined and repo_results:
         combined_notes = create_combined_release_notes(repo_results)
         
-        # Print combined release notes
+        # Generate upgrade recommendations if requested
+        upgrade_analysis = ""
+        if args.recommendation:
+            logger.info("🔍 Generating upgrade risk assessment and recommendations...")
+            upgrade_analysis = generate_upgrade_recommendations(
+                combined_notes, 
+                model, 
+                api_key, 
+                args.api_base_url, 
+                args.org_id
+            )
+        
+        # Combine upgrade analysis with release notes
+        final_output = ""
+        if upgrade_analysis:
+            final_output = upgrade_analysis + "\n\n---\n\n" + combined_notes
+        else:
+            final_output = combined_notes
+        
+        # Print combined release notes (with upgrade analysis if generated)
         print("\n========== 📢 Combined Release Notes ==========\n")
-        print(combined_notes)
+        print(final_output)
         print("\n=============================================\n")
         
         # Save combined release notes if output file specified
         if args.output_file:
-            save_release_notes(combined_notes, args.output_file)
+            save_release_notes(final_output, args.output_file)
     
     # Return success if we processed at least one repository
     return 0 if repo_results else 1
